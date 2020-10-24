@@ -146,6 +146,7 @@ def mk_dm(devname, table, readonly, exit_stack):
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
     proc.communicate(table)
     if proc.returncode != 0:
+        print('Warning: dmsetup create failed, trying --verifyudev', file=sys.stderr)
         needs_udev_fallback = True
         # dmsetup 1.02.65, wheezy/quantal
         cmd[2:2] = ['--verifyudev']
@@ -196,7 +197,9 @@ class BlockDevice:
 
     @memoized_property
     def superblock_type(self):
-        return self.superblock_at(0)
+        typ = self.superblock_at(0)
+        assert typ != ''
+        return typ
 
     def superblock_at(self, offset):
         try:
@@ -208,6 +211,7 @@ class BlockDevice:
         except subprocess.CalledProcessError as err:
             # No recognised superblock
             assert err.returncode == 2, err
+            return None
 
     @memoized_property
     def has_bcache_superblock(self):
@@ -533,7 +537,10 @@ class Filesystem(BlockData[BDev]):
 
         # measure size again
         self.read_superblock()
-        assert self.fssize == pos
+        assert self.fssize == pos, \
+            'Resize of {} failed. Expected fssize={}, got {}'.format(
+                self.device.devpath, pos, self.fssize,
+            )
 
     def grow_nonrec(self, upper_bound):
         newsize = align(upper_bound, self.block_size)
