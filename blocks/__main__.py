@@ -1689,6 +1689,11 @@ def main():
         return None
 
     args = parser.parse_args()
+
+    if os.geteuid() != 0:
+        print('This program must be run as root.', file=sys.stderr)
+        return 1
+
     return args.action(args)
 
 
