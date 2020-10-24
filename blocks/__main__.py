@@ -1,4 +1,4 @@
-# Python 3.3
+# -*- coding: utf-8 -*-
 
 import argparse
 import contextlib
@@ -17,8 +17,14 @@ import time
 import types
 import urllib.parse
 import uuid
+from abc import ABCMeta
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Generic, TypeVar
 
 import pkg_resources
+
+if TYPE_CHECKING:
+    from typing import List
 
 
 # 4MiB PE, for vgmerge compatibility
@@ -32,12 +38,7 @@ BCACHE_MAGIC = bytes.fromhex('c6 85 73 f6 4e 1a 45 ca 82 65 f5 7f 48 ba 6d 81')
 # Fairly strict, snooping an incorrect mapping would be bad
 dm_crypt_re = re.compile(
     r'^0 (?P<plainsize>\d+) crypt (?P<cipher>[a-z0-9:-]+) 0+ 0'
-    ' (?P<major>\d+):(?P<minor>\d+) (?P<offset>\d+)(?P<options> [^\n]*)?\n\Z',
-    re.ASCII)
-
-dm_kpartx_re = re.compile(
-    r'^0 (?P<partsize>\d+) linear'
-    ' (?P<major>\d+):(?P<minor>\d+) (?P<offset>\d+)\n\Z',
+    r' (?P<major>\d+):(?P<minor>\d+) (?P<offset>\d+)(?P<options> [^\n]*)?\n\Z',
     re.ASCII)
 
 
@@ -95,10 +96,10 @@ class memoized_property(object):
         obj.__dict__.pop(self.__name__, None)
 
 
-def quiet_call(cmd, *args, **kwargs):
+def quiet_call(cmd, **kwargs):
     # universal_newlines is used to enable io decoding in the current locale
     proc = subprocess.Popen(
-        cmd, *args, universal_newlines=True, stdin=subprocess.DEVNULL,
+        cmd, universal_newlines=True, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
     odat, edat = proc.communicate()
     if proc.returncode != 0:
@@ -115,13 +116,16 @@ class MissingRequirement(Exception):
 
 
 class Requirement:
+    cmd: str
+    pkg: str
+
     @classmethod
-    def require(self, progress):
-        assert '/' not in self.cmd
-        if shutil.which(self.cmd) is None:
+    def require(cls, progress):
+        assert '/' not in cls.cmd
+        if shutil.which(cls.cmd) is None:
             progress.bail(
                 'Command {!r} not found, please install the {} package'
-                .format(self.cmd, self.pkg), MissingRequirement(self))
+                .format(cls.cmd, cls.pkg), MissingRequirement(cls))
 
 
 class LVMReq(Requirement):
@@ -139,14 +143,14 @@ def mk_dm(devname, table, readonly, exit_stack):
     cmd = 'dmsetup create --'.split() + [devname]
     if readonly:
         cmd[2:2] = ['--readonly']
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    proc.communicate(table.encode('ascii'))
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
+    proc.communicate(table)
     if proc.returncode != 0:
         needs_udev_fallback = True
         # dmsetup 1.02.65, wheezy/quantal
         cmd[2:2] = ['--verifyudev']
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        proc.communicate(table.encode('ascii'))
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True)
+        proc.communicate(table)
         assert proc.returncode == 0, 'Report to https://github.com/g2p/blocks/issues/8 if you see this'
     cmd = 'dmsetup remove --'.split() + [devname]
     if needs_udev_fallback:
@@ -191,16 +195,6 @@ class BlockDevice:
         os.close(dev_fd)
 
     @memoized_property
-    def ptable_type(self):
-        # TODO: also detect an MBR other than protective,
-        # and refuse to edit that.
-        rv = subprocess.check_output(
-            'blkid -p -o value -s PTTYPE --'.split() + [self.devpath]
-        ).rstrip().decode('ascii')
-        if rv:
-            return rv
-
-    @memoized_property
     def superblock_type(self):
         return self.superblock_at(0)
 
@@ -208,8 +202,9 @@ class BlockDevice:
         try:
             return subprocess.check_output(
                 'blkid -p -o value -s TYPE -O'.split()
-                + ['%d' % offset, '--', self.devpath]
-            ).rstrip().decode('ascii')
+                + ['%d' % offset, '--', self.devpath],
+                text=True,
+            ).rstrip()
         except subprocess.CalledProcessError as err:
             # No recognised superblock
             assert err.returncode == 2, err
@@ -271,29 +266,17 @@ class BlockDevice:
         else:
             return True
 
-
     def dm_table(self):
         return subprocess.check_output(
             'dmsetup table --'.split() + [self.devpath],
             universal_newlines=True)
 
-    def dm_deactivate(self):
-        return quiet_call(
-            'dmsetup remove --'.split() + [self.devpath])
-
-    def dm_setup(self, table, readonly):
-        cmd = 'dmsetup create --'.split() + [self.devpath]
-        if readonly:
-            cmd[2:2] = ['--readonly']
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-        proc.communicate(table.encode('ascii'))
-        assert proc.returncode == 0
-
     @memoized_property
     def is_partition(self):
-        return (
-            os.path.exists(self.sysfspath + '/partition') and
-            bool(int(open(self.sysfspath + '/partition').read())))
+        if not os.path.exists(self.sysfspath + '/partition'):
+            return False
+        with open(self.sysfspath + '/partition') as f:
+            return bool(int(f.read()))
 
     def ptable_context(self):
         # the outer ptable and our offset within that
@@ -304,7 +287,8 @@ class BlockDevice:
         ptable_device = PartitionedDevice(
             devpath_from_sysdir(self.sysfspath + '/..'))
 
-        part_start = int(open(self.sysfspath + '/start').read()) * 512
+        with open(self.sysfspath + '/start') as f:
+            part_start = int(f.read()) * 512
         ptable = PartitionTable(
             device=ptable_device,
             parted_disk=parted.disk.Disk(ptable_device.parted_device))
@@ -338,23 +322,18 @@ class PartitionedDevice(BlockDevice):
         return parted.device.Device(self.devpath)
 
 
-class BlockData:
-    def __init__(self, device):
-        self.device = device
+BDev = TypeVar('BDev', bound=BlockDevice)
 
 
-class PartitionTable(BlockData):
+@dataclass
+class BlockData(Generic[BDev]):
+    device: BDev  # pytype: disable=not-supported-yet
+
+
+class PartitionTable(BlockData[PartitionedDevice]):
     def __init__(self, device, parted_disk):
         super(PartitionTable, self).__init__(device=device)
         self.parted_disk = parted_disk
-
-    @classmethod
-    def mkgpt(cls, device):
-        import parted
-        ptable_device = PartitionedDevice(device.devpath)
-        return cls(
-            device=ptable_device,
-            parted_disk=parted.freshDisk(ptable_device.parted_device, 'gpt'))
 
     def _iter_range(self, start_sector, end_sector):
         # Loop on partitions overlapping with the range, excluding free space
@@ -362,7 +341,7 @@ class PartitionTable(BlockData):
         # Careful: end_sector is exclusive here,
         # but parted geometry uses inclusive ends.
 
-        import _ped
+        import _ped  # pytype: disable=import-error
         while start_sector < end_sector:
             part = self.parted_disk.getPartitionBySector(start_sector)
             if not (part.type & _ped.PARTITION_FREESPACE):
@@ -371,7 +350,7 @@ class PartitionTable(BlockData):
             start_sector = part.geometry.end + 1
 
     def _reserve_range(self, start, end, progress):
-        import _ped
+        import _ped  # pytype: disable=import-error
         assert 0 <= start <= end
 
         # round down
@@ -458,7 +437,7 @@ class PartitionTable(BlockData):
 
         import parted.geometry
         import parted.constraint
-        import _ped
+        import _ped  # pytype: disable=import-error
 
         left_part = self.parted_disk.getPartitionBySector(start_sector1)
         right_part = self.parted_disk.getPartitionBySector(start_sector)
@@ -484,16 +463,28 @@ class PartitionTable(BlockData):
         self.parted_disk.commit()
 
 
-class Filesystem(BlockData):
-    resize_needs_mpoint = False
+@dataclass(init=False)
+class Filesystem(BlockData[BDev]):
+    # Subclass constants
+    vfstype: str
+    can_shrink: bool
+    sb_size_in_bytes: bool
+    resize_needs_mpoint: bool
+
+    # Instance attributes
+    block_count: int
+    block_size: int
+    size_bytes: int
+
     sb_size_in_bytes = False
+    resize_needs_mpoint = False
 
     def reserve_end_area_nonrec(self, pos):
         # align to a block boundary that doesn't encroach
         pos = align(pos, self.block_size)
 
         if self.fssize <= pos:
-            return
+            return None
 
         if not self.can_shrink:
             raise CantShrink(self)
@@ -522,20 +513,16 @@ class Filesystem(BlockData):
         with open('/proc/self/mountinfo') as mounts:
             for line in mounts:
                 items = line.split()
-                if False:
-                    idx = items.index('-')
-                    fs_type = items[idx + 1]
-                    opts1 = items[5].split(',')
-                    opts2 = items[idx + 3].split(',')
-                    readonly = 'ro' in opts1 + opts2
-                    intpath = items[3]
-                    mpoint = items[4]
-                    dev = os.path.realpath(items[idx + 2])
+                # idx: items.index('-')
+                # fstype: items[idx + 1]
+                # readonly: 'ro' in items[5].split(',') + items[idx + 3].split(',')
+                # intpath: items[3]
+                # mtpoint: items[4]
+                # dev: os.path.realpath(items[idx + 2])
                 devnum = items[2]
                 if dn == devnum:
                     return True
         return False
-
 
     def _mount_and_resize(self, pos):
         if self.resize_needs_mpoint and not self.is_mounted():
@@ -552,7 +539,7 @@ class Filesystem(BlockData):
         newsize = align(upper_bound, self.block_size)
         assert self.fssize <= newsize
         if self.fssize == newsize:
-            return
+            return None
         self._mount_and_resize(newsize)
         return newsize
 
@@ -561,51 +548,62 @@ class Filesystem(BlockData):
         if self.sb_size_in_bytes:
             assert self.size_bytes % self.block_size == 0
             return self.size_bytes
-        else:
-            return self.block_size * self.block_count
+        return self.block_size * self.block_count
 
     @memoized_property
     def fslabel(self):
         return subprocess.check_output(
-            'blkid -o value -s LABEL --'.split() + [self.device.devpath]
-        ).rstrip().decode('ascii')
+            'blkid -o value -s LABEL --'.split() + [self.device.devpath],
+            text=True,
+        ).rstrip()
 
     @memoized_property
     def fsuuid(self):
         return subprocess.check_output(
-            'blkid -o value -s UUID --'.split() + [self.device.devpath]
-        ).rstrip().decode('ascii')
+            'blkid -o value -s UUID --'.split() + [self.device.devpath],
+            text=True,
+        ).rstrip()
+
+    def read_superblock(self):
+        raise NotImplementedError
+
+    def _resize(self, target_size):
+        raise NotImplementedError
 
 
-class SimpleContainer(BlockData):
+@dataclass(init=False)
+class SimpleContainer(BlockData[BDev], metaclass=ABCMeta):
     # A single block device that wraps a single block device
     # (luks is one, but not lvm, lvm is m2m)
 
-    offset = None
+    offset: int
 
 
 def starts_with_word(line, word):
     return line.startswith(word) and line.split(maxsplit=1)[0] == word
 
 
-class BCacheBacking(SimpleContainer):
+class BCacheBacking(SimpleContainer[BDev]):
+    version: int
+
     def read_superblock(self):
-        self.offset = None
-        self.version = None
+        offset = version = None
 
         proc = subprocess.Popen(
             ['bcache-super-show', '--', self.device.devpath],
-            stdout=subprocess.PIPE)
+            stdout=subprocess.PIPE, text=True)
+        assert proc.stdout is not None
         for line in proc.stdout:
             if starts_with_word(line, b'sb.version'):
-                line = line.decode('ascii')
-                self.version = int(line.split()[1])
+                assert version is None
+                version = int(line.split()[1])
             elif starts_with_word(line, b'dev.data.first_sector'):
-                line = line.decode('ascii')
-                self.offset = int(line.split(maxsplit=1)[1]) * 512
+                assert offset is None
+                offset = int(line.split(maxsplit=1)[1]) * 512
         proc.wait()
         assert proc.returncode == 0
-        assert self.offset is not None
+        assert offset is not None and version is not None
+        self.offset, self.version = offset, version
 
     @property
     def is_backing(self):
@@ -621,7 +619,7 @@ class BCacheBacking(SimpleContainer):
         if not self.is_activated():
             # XXX How synchronous is this?
             with open('/sys/fs/bcache/register', 'w') as br:
-                br.write(self.devpath + '\n')
+                br.write(self.device.devpath + '\n')
         return BlockDevice(devpath_from_sysdir(self.device.sysfspath + '/bcache/dev'))
 
     def deactivate(self):
@@ -636,7 +634,7 @@ class BCacheBacking(SimpleContainer):
             raise NotImplementedError
         if not self.is_activated():
             # Nothing to do, bcache will pick up the size on activation
-            return
+            return None
         with open(self.device.sysfspath + '/bcache/resize', 'w') as sf:
             # XXX How synchronous is this?
             sf.write('max\n')
@@ -645,13 +643,15 @@ class BCacheBacking(SimpleContainer):
         return upper_bound
 
 
-class LUKS(SimpleContainer):
+class LUKS(SimpleContainer[BDev]):
     """
     pycryptsetup isn't used because:
         it isn't in PyPI, or in Debian or Ubuntu
         it isn't Python 3
         it's incomplete (resize not included)
     """
+
+    sb_end: int
 
     _superblock_read = False
 
@@ -679,7 +679,7 @@ class LUKS(SimpleContainer):
             if (
                 match and
                 int(match.group('offset')) == bytes_to_sector(self.offset)
-           ):
+            ):
                 return hld
 
     @memoized_property
@@ -695,25 +695,26 @@ class LUKS(SimpleContainer):
 
     def read_superblock(self):
         # read the cyphertext's luks superblock
-        #self.offset = cs.info()['offset']  # pycryptsetup
-        self.offset = None
+        offset = None
 
         proc = subprocess.Popen(
             ['cryptsetup', 'luksDump', '--', self.device.devpath],
-            stdout=subprocess.PIPE)
+            stdout=subprocess.PIPE, text=True)
+        assert proc.stdout is not None
         for line in proc.stdout:
-            if line.startswith(b'Payload offset:'):
-                line = line.decode('ascii')
-                self.offset = int(aftersep(line, ':')) * 512
+            if line.startswith('Payload offset:'):
+                assert offset is None
+                offset = int(aftersep(line, ':')) * 512
         proc.wait()
         assert proc.returncode == 0
+        assert offset is not None
+        self.offset = offset
         self._superblock_read = True
 
     def read_superblock_ll(self, fd):
         # Low-level
         # https://cryptsetup.googlecode.com/git/docs/on-disk-format.pdf
 
-        self.sb_end = None
         magic, version = struct.unpack('>6sH', os.pread(fd, 8, 0))
         assert magic == b'LUKS\xBA\xBE', magic
         assert version == 1
@@ -783,27 +784,29 @@ class LUKS(SimpleContainer):
         return pos
 
 
-class XFS(Filesystem):
+class XFS(Filesystem[BDev]):
     can_shrink = False
     resize_needs_mpoint = True
     vfstype = 'xfs'
 
     def read_superblock(self):
-        self.block_size = None
-        self.block_count = None
+        block_size = block_count = None
 
         proc = subprocess.Popen(
             ['xfs_db', '-c', 'sb 0', '-c', 'p dblocks blocksize',
-             '--', self.device.devpath], stdout=subprocess.PIPE)
+             '--', self.device.devpath], stdout=subprocess.PIPE, text=True)
+        assert proc.stdout is not None
         for line in proc.stdout:
-            if line.startswith(b'dblocks ='):
-                line = line.decode('ascii')
-                self.block_count = int(aftersep(line, '='))
-            elif line.startswith(b'blocksize ='):
-                line = line.decode('ascii')
-                self.block_size = int(aftersep(line, '='))
+            if line.startswith('dblocks ='):
+                assert block_count is None
+                block_count = int(aftersep(line, '='))
+            elif line.startswith('blocksize ='):
+                assert size_bytes is None
+                block_size = int(aftersep(line, '='))
         proc.wait()
         assert proc.returncode == 0
+        assert block_size is not None and block_count is not None
+        self.block_size, self.block_count = block_size, block_count
 
     def _resize(self, target_size):
         assert target_size % self.block_size == 0
@@ -813,29 +816,31 @@ class XFS(Filesystem):
              '--', self.device.devpath])
 
 
-class NilFS(Filesystem):
+class NilFS(Filesystem[BDev]):
     can_shrink = True
     sb_size_in_bytes = True
     resize_needs_mpoint = True
     vfstype = 'nilfs2'
 
     def read_superblock(self):
-        self.block_size = None
-        self.size_bytes = None
+        block_size = size_bytes = None
 
         proc = subprocess.Popen(
             'nilfs-tune -l --'.split() + [self.device.devpath],
-            stdout=subprocess.PIPE)
+            stdout=subprocess.PIPE, text=True)
 
+        assert proc.stdout is not None
         for line in proc.stdout:
-            if line.startswith(b'Block size:'):
-                line = line.decode('ascii')
-                self.block_size = int(aftersep(line, ':'))
-            elif line.startswith(b'Device size:'):
-                line = line.decode('ascii')
-                self.size_bytes = int(aftersep(line, ':'))
+            if line.startswith('Block size:'):
+                assert block_size is None
+                block_size = int(aftersep(line, ':'))
+            elif line.startswith('Device size:'):
+                assert size_bytes is None
+                size_bytes = int(aftersep(line, ':'))
         proc.wait()
         assert proc.returncode == 0
+        assert block_size is not None and size_bytes is not None
+        self.block_size, self.size_bytes = block_size, size_bytes
 
     def _resize(self, target_size):
         assert target_size % self.block_size == 0
@@ -844,7 +849,9 @@ class NilFS(Filesystem):
              self.device.devpath, '%d' % target_size])
 
 
-class BtrFS(Filesystem):
+class BtrFS(Filesystem[BDev]):
+    devid: int
+
     can_shrink = True
     sb_size_in_bytes = True
     # We'll get the mpoint ourselves
@@ -852,26 +859,27 @@ class BtrFS(Filesystem):
     vfstype = 'btrfs'
 
     def read_superblock(self):
-        self.block_size = None
-        self.size_bytes = None
-        self.devid = None
+        block_size = size_bytes = devid = None
 
         proc = subprocess.Popen(
-            'btrfs-show-super --'.split() + [self.device.devpath],
-            stdout=subprocess.PIPE)
+            'btrfs inspect-internal dump-super --'.split() + [self.device.devpath],
+            stdout=subprocess.PIPE, text=True)
 
+        assert proc.stdout is not None
         for line in proc.stdout:
-            if starts_with_word(line, b'dev_item.devid'):
-                line = line.decode('ascii')
-                self.devid = int(line.split(maxsplit=1)[1])
-            elif starts_with_word(line, b'sectorsize'):
-                line = line.decode('ascii')
-                self.block_size = int(line.split(maxsplit=1)[1])
-            elif starts_with_word(line, b'dev_item.total_bytes'):
-                line = line.decode('ascii')
-                self.size_bytes = int(line.split(maxsplit=1)[1])
+            if starts_with_word(line, 'dev_item.devid'):
+                assert devid is None
+                devid = int(line.split(maxsplit=1)[1])
+            elif starts_with_word(line, 'sectorsize'):
+                assert block_size is None
+                block_size = int(line.split(maxsplit=1)[1])
+            elif starts_with_word(line, 'dev_item.total_bytes'):
+                assert size_bytes is None
+                size_bytes = int(line.split(maxsplit=1)[1])
         proc.wait()
         assert proc.returncode == 0
+        assert block_size is not None and size_bytes is not None and devid is not None
+        self.block_size, self.size_bytes, self.devid = block_size, size_bytes, devid
 
     def _resize(self, target_size):
         assert target_size % self.block_size == 0
@@ -886,26 +894,28 @@ class BtrFS(Filesystem):
                 + ['{}:{}'.format(self.devid, target_size), mpoint])
 
 
-class ReiserFS(Filesystem):
+class ReiserFS(Filesystem[BDev]):
     can_shrink = True
 
     def read_superblock(self):
-        self.block_size = None
-        self.block_count = None
+        block_size = block_count = None
 
         proc = subprocess.Popen(
             'reiserfstune --'.split() + [self.device.devpath],
-            stdout=subprocess.PIPE)
+            stdout=subprocess.PIPE, text=True)
 
+        assert proc.stdout is not None
         for line in proc.stdout:
-            if line.startswith(b'Blocksize:'):
-                line = line.decode('ascii')
-                self.block_size = int(aftersep(line, ':'))
-            elif line.startswith(b'Count of blocks on the device:'):
-                line = line.decode('ascii')
-                self.block_count = int(aftersep(line, ':'))
+            if line.startswith('Blocksize:'):
+                assert block_size is None
+                block_size = int(aftersep(line, ':'))
+            elif line.startswith('Count of blocks on the device:'):
+                assert block_count is None
+                block_count = int(aftersep(line, ':'))
         proc.wait()
         assert proc.returncode == 0
+        assert block_size is not None and block_count is not None
+        self.block_size, self.block_count = block_size, block_count
 
     def _resize(self, target_size):
         assert target_size % self.block_size == 0
@@ -914,42 +924,46 @@ class ReiserFS(Filesystem):
              '--', self.device.devpath])
 
 
-class ExtFS(Filesystem):
+class ExtFS(Filesystem[BDev]):
+    state: str
+    mount_tm: time.struct_time
+    check_tm: time.struct_time
+
     can_shrink = True
 
     def read_superblock(self):
-        self.block_size = None
-        self.block_count = None
-        self.state = None
-        self.mount_tm = None
-        self.check_tm = None
+        block_size = block_count = state = mount_tm = check_tm = None
 
         proc = subprocess.Popen(
             'tune2fs -l --'.split() + [self.device.devpath],
-            stdout=subprocess.PIPE)
+            stdout=subprocess.PIPE, text=True)
 
+        assert proc.stdout is not None
         for line in proc.stdout:
-            if line.startswith(b'Block size:'):
-                line = line.decode('ascii')
-                self.block_size = int(aftersep(line, ':'))
-            elif line.startswith(b'Block count:'):
-                line = line.decode('ascii')
-                self.block_count = int(aftersep(line, ':'))
-            elif line.startswith(b'Filesystem state:'):
-                line = line.decode('ascii')
-                self.state = aftersep(line, ':').lstrip()
-            elif line.startswith(b'Last mount time:'):
-                line = line.decode('ascii')
+            if line.startswith('Block size:'):
+                assert block_size is None
+                block_size = int(aftersep(line, ':'))
+            elif line.startswith('Block count:'):
+                assert block_count is None
+                block_count = int(aftersep(line, ':'))
+            elif line.startswith('Filesystem state:'):
+                assert state is None
+                state = aftersep(line, ':').lstrip()
+            elif line.startswith('Last mount time:'):
+                assert mount_tm is None
                 date = aftersep(line, ':').lstrip()
                 if date == 'n/a':
-                    self.mount_tm = time.gmtime(0)
+                    mount_tm = time.gmtime(0)
                 else:
-                    self.mount_tm = time.strptime(date)
-            elif line.startswith(b'Last checked:'):
-                line = line.decode('ascii')
-                self.check_tm = time.strptime(aftersep(line, ':').lstrip())
+                    mount_tm = time.strptime(date)
+            elif line.startswith('Last checked:'):
+                check_tm = time.strptime(aftersep(line, ':').lstrip())
         proc.wait()
         assert proc.returncode == 0
+        assert not (block_size is None or block_count is None or state is None or mount_tm is None or check_tm is None)
+        self.block_size, self.block_count, self.state, self.mount_tm, self.check_tm = (
+            block_size, block_count, state, mount_tm, check_tm,
+        )
 
     def _resize(self, target_size):
         block_count, rem = divmod(target_size, self.block_size)
@@ -964,15 +978,16 @@ class ExtFS(Filesystem):
             # terminal on stdin
             subprocess.check_call(
                 'e2fsck -f --'.split() + [self.device.devpath])
-            # Another option:
-            #quiet_call('e2fsck -fp --'.split() + [self.device.devpath])
             self.check_tm = self.mount_tm
         quiet_call(
             'resize2fs --'.split() + [self.device.devpath, '%d' % block_count])
 
 
-class Swap(Filesystem):
+class Swap(Filesystem[BDev]):
     # Not exactly a filesystem
+    big_endian: bool
+    version: int
+
     can_shrink = True
 
     def is_mounted(self):
@@ -988,7 +1003,6 @@ class Swap(Filesystem):
         self.block_count = last_page + 1
         self.big_endian = big_endian
         self.version = version
-
 
     def __read_sb(self, dev_fd):
         # Assume 4k pages, bail otherwise
@@ -1010,7 +1024,6 @@ class Swap(Filesystem):
             raise UnsupportedSuperblock(device=self.device, last_page=0)
 
         return big_endian, version, last_page
-
 
     def _resize(self, target_size):
         # using mkswap+swaplabel like GParted would drop some metadata
@@ -1109,23 +1122,23 @@ class BlockStack:
 
 def get_block_stack(device, progress):
     # this cries for a conslist
-    stack = []
+    stack: List[BlockData[BlockDevice]] = []
     while True:
         if device.superblock_type == 'crypto_LUKS':
-            wrapper = LUKS(device)
-            stack.append(wrapper)
-            device = wrapper.cleartext_device
+            lwrapper = LUKS(device)
+            stack.append(lwrapper)
+            device = lwrapper.cleartext_device
             continue
         elif device.has_bcache_superblock:
-            wrapper = BCacheBacking(device)
-            wrapper.read_superblock()
-            if not wrapper.is_backing:
+            bwrapper = BCacheBacking(device)
+            bwrapper.read_superblock()
+            if not bwrapper.is_backing:
                 # We only want backing, not all bcache superblocks
                 progress.bail(
                     'BCache device isn\'t a backing device',
                     UnsupportedSuperblock(device=device))
-            stack.append(wrapper)
-            device = wrapper.cached_device
+            stack.append(bwrapper)
+            device = bwrapper.cached_device
             continue
 
         if device.superblock_type in {'ext2', 'ext3', 'ext4'}:
@@ -1154,6 +1167,11 @@ def get_block_stack(device, progress):
 
 
 class SyntheticDevice(BlockDevice):
+    data: bytes
+    rz_size: int
+    writable_hdr_size: int
+    writable_end_size: int
+
     def copy_to_physical(
         self, dev_fd, *, shift_by=0, reserved_area=None, other_device=False
     ):
@@ -1198,18 +1216,6 @@ class ProgressListener:
     pass
 
 
-class DefaultProgressHandler(ProgressListener):
-    """A progress listener that logs messages and raises exceptions
-    """
-
-    def notify(self, msg):
-        logging.info(msg)
-
-    def bail(self, msg, err):
-        logging.error(msg)
-        raise err
-
-
 class CLIProgressHandler(ProgressListener):
     """A progress listener that prints messages and exits on error
     """
@@ -1234,9 +1240,10 @@ def synth_device(writable_hdr_size, rz_size, writable_end_size=0):
         imgf.truncate(writable_hdr_size + writable_end_size)
 
         lo_dev = subprocess.check_output(
-            'losetup -f --show --'.split() + [imgf.name]
-        ).rstrip().decode('ascii')
-        assert lo_dev.startswith('/'), lo_dv
+            'losetup -f --show --'.split() + [imgf.name],
+            text=True,
+        ).rstrip()
+        assert lo_dev.startswith('/'), lo_dev
         st.callback(
             lambda: quiet_call('losetup -d'.split() + [lo_dev]))
         rozeros_devname = 'rozeros-{}'.format(uuid.uuid1())
@@ -1423,8 +1430,8 @@ def rotate_lv(*, device, size, debug, forward):
             loadpath=pkg_resources.resource_filename('blocks', 'augeas'),
             root='/dev/null',
             flags=augeas.Augeas.NO_MODL_AUTOLOAD | augeas.Augeas.SAVE_NEWFILE)
-        vgcfg = open(vgcfgname)
-        vgcfg_orig = vgcfg.read()
+        with open(vgcfgname) as vgcfg:
+            vgcfg_orig = vgcfg.read()
         aug.set('/raw/vgcfg', vgcfg_orig)
 
         aug.text_store('LVM.lns', '/raw/vgcfg', '/vg')
@@ -1441,10 +1448,12 @@ def rotate_lv(*, device, size, debug, forward):
 
         rotate_aug(aug, forward, size)
         aug.text_retrieve('LVM.lns', '/raw/vgcfg', '/vg', '/raw/vgcfg.new')
-        open(vgcfgname + '.new', 'w').write(aug.get('/raw/vgcfg.new'))
+        with open(vgcfgname + '.new', 'w') as f:
+            f.write(aug.get('/raw/vgcfg.new'))
         rotate_aug(aug, not forward, size)
         aug.text_retrieve('LVM.lns', '/raw/vgcfg', '/vg', '/raw/vgcfg.backagain')
-        open(vgcfgname + '.backagain', 'w').write(aug.get('/raw/vgcfg.backagain'))
+        with open(vgcfgname + '.backagain', 'w') as f:
+            f.write(aug.get('/raw/vgcfg.backagain'))
 
         if debug:
             print('CHECK STABILITY')
@@ -1547,7 +1556,7 @@ def part_to_bcache(device, debug, progress, join):
     # there is no need.
     bsb_size = 1024**2
     data_size = device.size
-    import _ped
+    import _ped  # pytype: disable=import-error
 
     ptable, part_start = device.ptable_context()
     ptype = ptable.parted_disk.getPartitionBySector(
@@ -1560,12 +1569,11 @@ def part_to_bcache(device, debug, progress, join):
     ptable.reserve_space_before(part_start, bsb_size, progress)
     part_start1 = part_start - bsb_size
 
-    import _ped
     write_part = ptable.parted_disk.getPartitionBySector(part_start1 // 512)
 
     if write_part.type == _ped.PARTITION_NORMAL:
         write_offset = part_start1 - (512 * write_part.geometry.start)
-        dev_fd = os.open(write_part.path, os.O_SYNC|os.O_RDWR|os.O_EXCL)
+        dev_fd = os.open(write_part.path, os.O_SYNC | os.O_RDWR | os.O_EXCL)
     elif write_part.type == _ped.PARTITION_FREESPACE:
         # XXX Can't open excl if one of the partitions is used by dm, apparently
         dev_fd = ptable.device.open_excl()
@@ -1650,10 +1658,9 @@ def main():
 
     # Undoes an lv to bcache conversion; useful to migrate from the GPT
     # format to the bcache-offset format.
-    # No help, keep this undocumented for now
     sp_rotate = commands.add_parser(
-        'rotate')
-        #help='Rotate LV contents to start at the second PE')
+        'rotate',
+        help='Rotate LV contents to start at the second PE')
     sp_rotate.add_argument('device')
     sp_rotate.set_defaults(action=cmd_rotate)
 
@@ -1672,7 +1679,7 @@ def main():
     # Give help when no subcommand is given
     if not sys.argv[1:]:
         parser.print_help()
-        return
+        return None
 
     args = parser.parse_args()
     return args.action(args)
@@ -1682,7 +1689,6 @@ def cmd_resize(args):
     device = BlockDevice(args.device)
     newsize = args.newsize
     resize_device = args.resize_device
-    debug = args.debug
     progress = CLIProgressHandler()
 
     block_stack = get_block_stack(device, progress)
@@ -1713,7 +1719,6 @@ def cmd_resize(args):
 def cmd_rotate(args):
     device = BlockDevice(args.device)
     debug = args.debug
-    progress = CLIProgressHandler()
 
     pe_size = int(subprocess.check_output(
         'lvm lvs --noheadings --rows --units=b --nosuffix '
@@ -1756,28 +1761,27 @@ def cmd_to_bcache(args):
     if args.maintboot:
         return call_maintboot(
             device, 'to-bcache', debug=args.debug, join=args.join)
-    else:
-        return impl(
-            device=device, debug=args.debug, progress=progress, join=args.join)
+    return impl(
+        device=device, debug=args.debug, progress=progress, join=args.join)
 
 
 def call_maintboot(device, command, **args):
-        fsuuid = Filesystem(device).fsuuid
-        if not fsuuid:
-            print(
-                'Device {} doesn\'t have a UUID'.format(device.devpath),
-                file=sys.stderr)
-            return 1
-        encoded = urllib.parse.quote(json.dumps(dict(
-            command=command, device=fsuuid, **args)))
-        subprocess.check_call(
-            ['maintboot', '--pkgs']
-            + 'python3-blocks util-linux dash mount base-files libc-bin'
-            '  nilfs-tools reiserfsprogs xfsprogs e2fsprogs btrfs-tools'
-            '  lvm2 cryptsetup-bin bcache-tools'.split()
-            + ['--initscript', pkg_resources.resource_filename(
-                'blocks', 'maintboot.init')]
-            + ['--append', 'BLOCKS_ARGS=' + encoded])
+    fsuuid = Filesystem(device).fsuuid
+    if not fsuuid:
+        print(
+            'Device {} doesn\'t have a UUID'.format(device.devpath),
+            file=sys.stderr)
+        return 1
+    encoded = urllib.parse.quote(json.dumps(dict(
+        command=command, device=fsuuid, **args)))
+    subprocess.check_call(
+        ['maintboot', '--pkgs']
+        + 'python3-blocks util-linux dash mount base-files libc-bin'
+        '  nilfs-tools reiserfsprogs xfsprogs e2fsprogs btrfs-tools'
+        '  lvm2 cryptsetup-bin bcache-tools'.split()
+        + ['--initscript', pkg_resources.resource_filename(
+            'blocks', 'maintboot.init')]
+        + ['--append', 'BLOCKS_ARGS=' + encoded])
 
 
 def cmd_maintboot_impl(args):
@@ -1813,10 +1817,11 @@ def cmd_to_lvm(args):
             'lvm vgs --noheadings --rows --units=b --nosuffix '
             '-o vg_name,vg_uuid,vg_extent_size --'.split()
             + [args.join], universal_newlines=True).splitlines()
-        join_name, join_uuid, pe_size = (fi.lstrip() for fi in vg_info)
+        # second element is join_uuid
+        join_name, _, pe_size_str = (fi.lstrip() for fi in vg_info)
         # Pick something unique, temporary until vgmerge
         vgname = uuid.uuid1().hex
-        pe_size = int(pe_size)
+        pe_size = int(pe_size_str)
     elif args.vgname is not None:
         # Check no VG with that name exists?
         # No real need, vgrename uuid newname would fix any collision
@@ -1860,7 +1865,7 @@ def cmd_to_lvm(args):
     block_stack.read_superblocks()
     block_stack.stack_reserve_end_area(pe_newpos, progress)
 
-    fsuuid = block_stack.topmost.fsuuid
+    fsuuid = getattr(block_stack.topmost, 'fsuuid', None)
     block_stack.deactivate()
     del block_stack
 
@@ -1995,17 +2000,10 @@ def cmd_to_lvm(args):
         quiet_call(
             ['lvm', 'vgmerge', '--', join_name, vgname])
         vgname = join_name
-    if False:
-        print('Enable the volume group with\n'
-              '    sudo lvm vgchange -ay -- {}'.format(vgname))
-    elif False:
-        print('Enable the logical volume with\n'
-              '    sudo lvm lvchange -ay -- {}/{}'.format(vgname, lvname))
-    else:
-        print('Volume group name: {}\n'
-              'Logical volume name: {}\n'
-              'Filesystem uuid: {}'
-              .format(vgname, lvname, fsuuid))
+    print('Volume group name: {}\n'
+          'Logical volume name: {}\n'
+          'Filesystem uuid: {}'
+          .format(vgname, lvname, fsuuid))
 
 
 def script_main():
@@ -2014,4 +2012,3 @@ def script_main():
 
 if __name__ == '__main__':
     script_main()
-
